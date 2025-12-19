@@ -1,0 +1,208 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width,initial-scale=1" />
+	<title>Elf Sound Effect Prank</title>
+	<style>
+		body{font-family:Segoe UI,Roboto,Arial;max-width:760px;margin:28px auto;padding:16px}
+		h1{margin:0 0 8px}
+		.controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+		button{padding:8px 12px;font-size:14px}
+		.meter{height:12px;background:#eee;border-radius:6px;overflow:hidden;margin:8px 0}
+		.meter > i{display:block;height:100%;background:linear-gradient(90deg,#4caf50,#8bc34a);width:0}
+		.status{margin-top:8px}
+		.small{font-size:13px;color:#555}
+	</style>
+</head>
+<body>
+	<h1>Elf sound effect prank</h1>
+	<p class="small">Make one short sound to trigger <code>hi.mp3</code>. Make two short sounds (quickly) to trigger <code>hi-mommy-child-voice.mp3</code>.</p>
+
+	<div class="controls">
+		<button id="startBtn">Start listening</button>
+		<button id="stopBtn" disabled>Stop listening</button>
+		<button id="test1">Play hi.mp3</button>
+		<button id="test2">Play hi-mommy-child-voice.mp3</button>
+	</div>
+
+	<label>Sensitivity: <span id="thresholdLabel">0.02</span></label>
+	<input id="threshold" type="range" min="0.005" max="0.06" step="0.001" value="0.02" style="width:100%" />
+
+	<div class="meter" aria-hidden>
+		<i id="meterBar"></i>
+	</div>
+
+	<div class="status">
+		<div>Detected peaks in window: <strong id="count">0</strong></div>
+		<div>Last action: <span id="action">idle</span></div>
+	</div>
+
+	<script>
+		// Paths relative to this HTML file
+		const SOUNDS = {
+			1: 'Sounds/hi.mp3',
+			2: 'Sounds/hi-mommy-child-voice.mp3'
+		};
+
+		const startBtn = document.getElementById('startBtn');
+		const stopBtn = document.getElementById('stopBtn');
+		const test1 = document.getElementById('test1');
+		const test2 = document.getElementById('test2');
+		const thresholdEl = document.getElementById('threshold');
+		const thresholdLabel = document.getElementById('thresholdLabel');
+		const meterBar = document.getElementById('meterBar');
+		const countEl = document.getElementById('count');
+		const actionEl = document.getElementById('action');
+
+		let audioCtx = null;
+		let analyser = null;
+		let dataArray = null;
+		let source = null;
+		let rafId = null;
+		let stream = null;
+
+		// Detection state
+		let lastPeakTime = 0;
+		let peakCount = 0;
+		let windowTimer = null;
+
+		const DEBOUNCE_MS = 250; // minimum ms between counted peaks
+		const WINDOW_MS = 900; // how long to wait after first peak to decide 1 vs 2
+
+		function ensureAudioCtx(){
+			if(!audioCtx){
+				audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+			}
+			return audioCtx;
+		}
+
+		function startListening(){
+			if(rafId) return;
+			navigator.mediaDevices.getUserMedia({audio:true}).then(s => {
+				stream = s;
+				ensureAudioCtx();
+				source = audioCtx.createMediaStreamSource(stream);
+				analyser = audioCtx.createAnalyser();
+				analyser.fftSize = 2048;
+				dataArray = new Float32Array(analyser.fftSize);
+				source.connect(analyser);
+
+				startBtn.disabled = true;
+				stopBtn.disabled = false;
+
+				// resume context on some browsers that start suspended
+				if(audioCtx.state === 'suspended'){
+					audioCtx.resume();
+				}
+
+				loop();
+			}).catch(err => {
+				alert('Microphone access denied or not available. ' + err.message);
+			});
+		}
+
+		function stopListening(){
+			if(stream){
+				stream.getTracks().forEach(t => t.stop());
+				stream = null;
+			}
+			if(rafId) cancelAnimationFrame(rafId);
+			rafId = null;
+			startBtn.disabled = false;
+			stopBtn.disabled = true;
+			analyser = null;
+			source = null;
+			dataArray = null;
+			peakCount = 0;
+			countEl.textContent = '0';
+			actionEl.textContent = 'stopped';
+		}
+
+		function loop(){
+			rafId = requestAnimationFrame(loop);
+			analyser.getFloatTimeDomainData(dataArray);
+			// compute RMS
+			let sum = 0;
+			for(let i=0;i<dataArray.length;i++){
+				const v = dataArray[i];
+				sum += v*v;
+			}
+			const rms = Math.sqrt(sum / dataArray.length);
+
+			// update meter
+			const meter = Math.min(1, rms * 10);
+			meterBar.style.width = (meter*100) + '%';
+
+			const threshold = parseFloat(thresholdEl.value);
+			if(rms > threshold){
+				const now = Date.now();
+				if(now - lastPeakTime > DEBOUNCE_MS){
+					lastPeakTime = now;
+					peakCount++;
+					countEl.textContent = peakCount;
+
+					if(peakCount === 1){
+						// start window timer
+						if(windowTimer) clearTimeout(windowTimer);
+						windowTimer = setTimeout(() => {
+							handlePeakCount(peakCount);
+						}, WINDOW_MS);
+					} else if(peakCount === 2){
+						// If we already saw 2, we can act immediately (shorter perceived latency)
+						if(windowTimer) clearTimeout(windowTimer);
+						handlePeakCount(peakCount);
+					}
+				}
+			}
+		}
+
+		function handlePeakCount(n){
+			peakCount = 0;
+			countEl.textContent = '0';
+			windowTimer = null;
+
+			if(n <= 0) return;
+			if(n === 1){
+				playClip(SOUNDS[1]);
+				actionEl.textContent = 'Played hi.mp3 (1 sound)';
+			} else {
+				// 2 or more => play the mommy clip per request
+				playClip(SOUNDS[2]);
+				actionEl.textContent = 'Played hi-mommy-child-voice.mp3 (' + n + ' sounds)';
+			}
+		}
+
+		function playClip(path){
+			// create a fresh Audio element each time to avoid playback reuse issues
+			const a = new Audio(path);
+			// ensure AudioContext resumed on user gesture
+			if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+			a.play().catch(err => {
+				console.warn('Playback blocked or failed:', err);
+				actionEl.textContent = 'Playback failed: ' + err.message;
+			});
+		}
+
+		thresholdEl.addEventListener('input', () => {
+			thresholdLabel.textContent = thresholdEl.value;
+		});
+
+		startBtn.addEventListener('click', () => {
+			// some browsers require a user gesture to unlock audio playback / context
+			ensureAudioCtx();
+			startListening();
+		});
+		stopBtn.addEventListener('click', stopListening);
+
+		test1.addEventListener('click', () => playClip(SOUNDS[1]));
+		test2.addEventListener('click', () => playClip(SOUNDS[2]));
+
+		// show a hint to resume audio if needed
+		document.addEventListener('click', () => {
+			if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+		}, {once:true});
+	</script>
+</body>
+</html>
